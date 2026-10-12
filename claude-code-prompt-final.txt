@@ -1,0 +1,89 @@
+I'm building "Warm List: Pulse Monitor", a B2B account signal monitor for Arjun, who sells a workforce management SaaS product to mid-market and enterprise companies in India. He manages 10 active accounts. Twice a week the system checks live news for each account, uses Gemini to judge which accounts have a real trigger right now, writes ONLY signal columns back to his Supabase table, and emails him a Hot List. The file signal-guide.txt in this folder is the instruction file Gemini must follow. Build the complete project: database, scheduled job, news fetching, AI scoring, Supabase write-back, Hot List email and dashboard.
+
+THE CORE RULE
+The system finds signals and suggests. Arjun decides. Arjun's own columns (his notes, last-contact date, his read on the relationship) must NEVER be written by the system. The system never contacts any prospect. The only email it sends is the Hot List to Arjun.
+
+STACK
+- Next.js (App Router) deployed on Vercel. Node is NOT installed on my Mac, so I can't run anything locally. Keep dependencies minimal, make sure it builds cleanly on Vercel, and tell me if anything needs to be checked after deploy.
+- Supabase for the database (use @supabase/supabase-js on the server only, with the secret key).
+- Gemini API, model gemini-3.5-flash, for ALL AI steps (call the REST API with fetch, header x-goog-api-key, and ask for JSON output). Do not use any other AI provider.
+- Resend for email (call the REST API with fetch).
+- Live news from Google News RSS (free, no key): https://news.google.com/rss/search?q=<search phrase URL-encoded>+when:3d&hl=en-IN&gl=IN&ceid=IN:en
+  Parse the XML on the server (a small library like fast-xml-parser is fine).
+- Environment variables (read from process.env, never hardcoded, never sent to the browser):
+  SUPABASE_URL, SUPABASE_SECRET_KEY, GEMINI_API_KEY, RESEND_API_KEY, EMAIL_TEST_RECIPIENT, CRON_SECRET
+- Name the project arjun-signals (package.json name). Use the page title "Warm List: Pulse Monitor".
+- Create .env.local with empty placeholders, a .env.example, and a .gitignore that includes .env.local, .env, node_modules and .next.
+- The dashboard must open WITHOUT a password, so my professor can view it.
+
+SIGNAL GUIDE
+signal-guide.txt is the readable source. So it is always bundled on Vercel, also copy its full text into lib/signalGuide.ts as an exported string, and use that string in every Gemini call. Add a comment saying both must be kept in sync.
+
+DATABASE
+Create a file supabase/schema.sql that I will paste into the Supabase SQL Editor myself. Tables:
+
+1. accounts
+   Arjun's columns (the system may READ these but NEVER write them):
+   id, company_name, segment (Enterprise / Mid-market), stage (Initial outreach / Live pilot / Signed customer, expanding), search_phrase, arjun_notes, last_contact_date, relationship_read
+   Signal columns (the ONLY columns the system may write):
+   signal_score (integer 0-10, default 0), trigger_types (json), signal_summary (text), outreach_angle (text), source_url (text), source_title (text), signal_found_at (timestamp), last_checked_at (timestamp), check_status (ok / no_news / failed)
+
+2. seen_stories: id, account_id, story_key (hash of the link, or of the title if no link), first_seen_at. Unique on (account_id, story_key).
+
+3. run_log: id, started_at, finished_at, triggered_by (cron / manual), accounts_checked, stories_found, signals_found, failures (json), email_sent (boolean), notes.
+
+Include inserts for these 10 accounts. Write short, believable, clearly fictional notes in Arjun's voice for arjun_notes and relationship_read, and a last_contact_date within the last 2 months:
+| company_name | search_phrase | segment | stage |
+| Swiggy | Swiggy | Enterprise | Signed customer, expanding |
+| Delhivery | Delhivery | Enterprise | Live pilot |
+| Apollo Hospitals | Apollo Hospitals | Enterprise | Live pilot |
+| Lenskart | Lenskart | Enterprise | Initial outreach |
+| DMart | DMart Avenue Supermarts | Enterprise | Initial outreach |
+| Licious | Licious | Mid-market | Signed customer, expanding |
+| Shadowfax | Shadowfax logistics | Mid-market | Live pilot |
+| Lemon Tree Hotels | Lemon Tree Hotels | Mid-market | Initial outreach |
+| Wakefit | Wakefit | Mid-market | Initial outreach |
+| Country Delight | Country Delight | Mid-market | Initial outreach |
+
+PROTECTING ARJUN'S COLUMNS (this is the most important requirement)
+- Create ONE function, lib/writeSignals.ts, that is the only place in the code allowed to update the accounts table.
+- It must contain a fixed allowlist of the signal columns above and strip out any other key before writing. If any other column is passed in, drop it and log a warning.
+- Never use upsert or a full-row update on accounts. Only update the allowlisted columns, by id.
+- Put a clear comment at the top of this file explaining that Arjun's columns are protected by design.
+
+PIPELINE (one run)
+Runs in /api/run. Process accounts in batches of 3 in parallel to stay within Vercel's time limit, and set maxDuration to 60 on the route. One account failing must never stop the others.
+For each account:
+1. Fetch Google News RSS for its search_phrase. Keep only stories published in the last 3 days. Take at most the 10 most recent. Keep title, link, source name, published date and the description snippet.
+2. Remove stories already in seen_stories for this account. Save the new ones to seen_stories.
+3. If there are no new stories: set check_status = no_news, set signal_score = floor(previous signal_score / 2), update last_checked_at, and leave signal_summary, outreach_angle and source fields as they were. This is the "going quiet" rule.
+4. If there are new stories: make ONE Gemini call for this account. Send the signal guide, the company name, segment and stage, and the list of new stories. Do NOT send arjun_notes, last_contact_date or relationship_read to Gemini. Gemini returns the JSON described in section 6 of the signal guide.
+5. If Gemini returns signal_score > 0: write signal_score = max(new score, floor(previous score / 2)), plus trigger_types, signal_summary, outreach_angle, source_url, source_title, signal_found_at = now, last_checked_at = now, check_status = ok.
+   If Gemini returns 0: treat it like step 3 (no relevant signal), but with check_status = ok.
+6. If the news fetch or Gemini call fails: set check_status = failed and last_checked_at = now, change nothing else, and record the error in the run log.
+After all accounts: write the run_log row, then send the Hot List email.
+
+SCHEDULE AND TRIGGERS
+- vercel.json cron: Monday and Thursday at 7:00 am India time = "30 1 * * 1,4" (UTC), calling /api/run.
+- /api/run accepts the cron call only when the Authorization header equals "Bearer " + CRON_SECRET (this is how Vercel cron authenticates).
+- The dashboard has a "Check now and email me" button. It calls a separate server route, /api/run-now, which runs the same pipeline with triggered_by = manual. To prevent abuse, /api/run-now refuses to run if another run started less than 5 minutes ago and shows a friendly message instead. The browser must never see CRON_SECRET.
+
+HOT LIST EMAIL
+- Send to EMAIL_TEST_RECIPIENT, from "Warm List <onboarding@resend.dev>".
+- Subject: "Hot List, <day> <date>: <N> warm accounts this week".
+- Opening line: "Morning Arjun. <N> of your 10 accounts had a relevant signal in the last 3 days. Check each source before you reach out."
+- Warm accounts = signal_found_at within the last 3 days and signal_score > 0, ranked by signal_score, highest first, at most 10. For each: number and company name, a score badge (8-10 red, 5-7 amber, 1-4 grey), a small line with segment, stage and trigger type names, then "What changed:" (signal_summary), "Outreach angle:" (outreach_angle), and "Source:" (source_title as a link to source_url).
+- "Quiet this week" section: one short line listing the other accounts with their current score.
+- "Couldn't check" section: only if any account has check_status = failed.
+- Footer: "Suggestions only. Your notes and last-contact dates weren't changed. Full list on your dashboard." with a link to the dashboard.
+- If there are no warm accounts, still send the email, saying plainly that it's a quiet week.
+- Clean HTML email: white background, readable on a phone, no images. Small "Warm List: Pulse Monitor" name at the top.
+
+DASHBOARD (home page)
+- Header: title "Warm List: Pulse Monitor", subtitle "Account signals for Arjun, checked every Monday and Thursday", when the last run happened, and the "Check now and email me" button with a clear loading state and result message.
+- Ranked list of all 10 accounts by signal_score. Each row: company, segment, stage, score badge, signal summary, outreach angle, source link, last checked, check status.
+- For each account, show Arjun's columns (notes, last contact, relationship read) in a visually separate, read-only area labelled "Your notes (never changed by the system)".
+- A small "Recent runs" section from run_log: time, manual or scheduled, stories found, signals found, failures.
+- Design: clean, professional, minimal. White background, one accent colour, readable on a laptop. The scores and the warm accounts should be the most visible things.
+
+When you're done, list every file with a one-line explanation, then give me numbered next steps in plain English (I'm not technical): what to paste into Supabase, which environment variables to add in Vercel, how to create a CRON_SECRET, and how to test.
