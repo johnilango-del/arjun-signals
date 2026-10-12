@@ -11,6 +11,7 @@ const BATCH_SIZE = 3;
 const ACCOUNT_BUDGET_MS = 48_000;
 const NEWS_TIMEOUT_MS = 8_000;
 const GEMINI_TIMEOUT_MS = 25_000;
+const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
 
 // The pipeline only loads the columns it needs. Arjun's notes, last-contact
 // date and relationship read are never loaded here, so they can never be
@@ -22,6 +23,7 @@ interface PipelineAccount {
   stage: string;
   search_phrase: string;
   signal_score: number;
+  signal_found_at: string | null;
 }
 
 interface AccountResult {
@@ -53,6 +55,12 @@ async function processAccount(acc: PipelineAccount, deadline: number): Promise<A
   const nowIso = () => new Date().toISOString();
   const previous = acc.signal_score ?? 0;
   const decayed = Math.floor(previous / 2);
+  // "Going quiet" rule: with no new signal, halve the score only once the
+  // existing signal is more than 3 days old (or there is none). A signal
+  // that is 3 days old or newer keeps its score.
+  const signalIsFresh =
+    !!acc.signal_found_at && Date.now() - new Date(acc.signal_found_at).getTime() <= THREE_DAYS_MS;
+  const quietScore = signalIsFresh ? previous : decayed;
 
   try {
     const timeLeft = () => deadline - Date.now();
@@ -78,7 +86,7 @@ async function processAccount(acc: PipelineAccount, deadline: number): Promise<A
     if (fresh.length === 0) {
       await writeSignals(acc.id, {
         check_status: 'no_news',
-        signal_score: decayed,
+        signal_score: quietScore,
         last_checked_at: nowIso(),
       });
       return { storiesFound: 0, signalFound: false };
@@ -102,9 +110,15 @@ async function processAccount(acc: PipelineAccount, deadline: number): Promise<A
 
     // 5. Write the result.
     if (verdict.signal_score > 0) {
+      // A weaker new signal never replaces a stronger signal that is still
+      // fresh (3 days old or newer): keep its score and its details.
+      if (signalIsFresh && previous > verdict.signal_score) {
+        await writeSignals(acc.id, { check_status: 'ok', last_checked_at: nowIso() });
+        return { storiesFound: fresh.length, signalFound: true };
+      }
       const now = nowIso();
       await writeSignals(acc.id, {
-        signal_score: Math.max(verdict.signal_score, decayed),
+        signal_score: Math.max(verdict.signal_score, quietScore),
         trigger_types: verdict.trigger_types,
         signal_summary: verdict.signal_summary,
         outreach_angle: verdict.outreach_angle,
@@ -120,7 +134,7 @@ async function processAccount(acc: PipelineAccount, deadline: number): Promise<A
     // Gemini says nothing relevant: same as going quiet, but status ok.
     await writeSignals(acc.id, {
       check_status: 'ok',
-      signal_score: decayed,
+      signal_score: quietScore,
       last_checked_at: nowIso(),
     });
     return { storiesFound: fresh.length, signalFound: false };
@@ -154,7 +168,7 @@ export async function runPipeline(triggeredBy: 'cron' | 'manual', dashboardUrl: 
 
   const { data: accounts, error: accErr } = await db
     .from('accounts')
-    .select('id, company_name, segment, stage, search_phrase, signal_score')
+    .select('id, company_name, segment, stage, search_phrase, signal_score, signal_found_at')
     .order('id');
   if (accErr) throw new Error(`Could not load accounts: ${accErr.message}`);
 
